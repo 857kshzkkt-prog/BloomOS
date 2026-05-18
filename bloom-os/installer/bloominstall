@@ -322,44 +322,89 @@ mount_filesystems() {
 bootstrap_base_system() {
     log_step "Installing Base System"
 
-    log_info "Running pacstrap to install base Arch Linux..."
+    # ═══════════════════════════════════════════════════════════════════════
+    # STEP 1: Sync package databases on the host system
+    # ═══════════════════════════════════════════════════════════════════════
 
-    # Install base system packages
-    pacstrap /mnt \
-        base \
-        base-devel \
-        linux \
-        linux-firmware \
-        mkinitcpio \
-        sudo \
-        nano \
-        vim \
-        openssh \
-        dhcpcd \
-        iwd \
-        wpa_supplicant \
-        networkmanager \
-        iproute2 \
-        inetutils \
-        less \
-        man-db \
-        man-pages \
-        texinfo \
-        efibootmgr \
-        dosfstools \
-        mtools \
-        gptfdisk \
-        bsdtar \
-        zstd \
-        curl \
-        wget \
-        git
+    log_info "Synchronizing package databases with Arch Linux mirrors..."
 
-    if [[ $? -ne 0 ]]; then
-        log_error "Failed to install base system packages."
+    # Run pacman sync to update local package databases
+    if ! pacman -Sy --noconfirm; then
+        log_error "Failed to synchronize package databases. Check your internet connection."
     fi
 
-    log_success "Base system installed successfully"
+    log_success "Package databases synchronized"
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # STEP 2: Verify essential tools are available
+    # ═══════════════════════════════════════════════════════════════════════
+
+    log_info "Verifying essential installation tools..."
+
+    # Check for pacstrap
+    if ! command -v pacstrap &>/dev/null; then
+        log_info "Installing arch-install-scripts for pacstrap..."
+        pacman -Sy --noconfirm arch-install-scripts
+    fi
+
+    # Verify pacstrap is now available
+    if ! command -v pacstrap &>/dev/null; then
+        log_error "pacstrap is not available. Cannot continue with installation."
+    fi
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # STEP 3: Run pacstrap to install base Arch Linux system
+    # ═══════════════════════════════════════════════════════════════════════
+
+    log_info "Running pacstrap to install base Arch Linux..."
+
+    # Define the core package list for a minimal bootable Arch system
+    # Note: 'bsdtar' is provided by the 'libarchive' package
+    local packages=(
+        "base"
+        "base-devel"
+        "linux"
+        "linux-firmware"
+        "mkinitcpio"
+        "libarchive"       # Provides bsdtar for package extraction
+        "zstd"             # Compression tool for initramfs
+        "sudo"
+        "nano"
+        "vim"
+        "openssh"
+        "dhcpcd"
+        "iwd"
+        "wpa_supplicant"
+        "networkmanager"
+        "iproute2"
+        "inetutils"
+        "less"
+        "man-db"
+        "man-pages"
+        "texinfo"
+        "dosfstools"
+        "mtools"
+        "gptfdisk"
+        "curl"
+        "wget"
+        "git"
+    )
+
+    # Execute pacstrap with the package list
+    if ! pacstrap /mnt "${packages[@]}"; then
+        log_error "Failed to install base system packages via pacstrap."
+    fi
+
+    # Verify the installation was successful by checking if critical files exist
+    if [[ ! -f /mnt/etc/passwd ]]; then
+        log_error "Base system installation appears incomplete. /mnt/etc/passwd not found."
+    fi
+
+    if [[ ! -d /mnt/var/lib/pacman ]]; then
+        log_error "Base system installation appears incomplete. /mnt/var/lib/pacman not found."
+    fi
+
+    log_success "Base system installed successfully to /mnt"
 }
 
 generate_fstab() {
@@ -683,22 +728,22 @@ display_banner() {
     cat << 'BANNER'
 
 ╔═════════════════════════════════════════════════════════════════════════════════════════════════════════════╗
-║                                                                                                             ║
-║  _______      .---.          ,-----.         ,-----.      ,---.    ,---.     ,-----.        .-'''-.         ║
-║  \  ____  \    | ,_|        .'  .-,  '.     .'  .-,  '.   |    \  /    |   .'  .-,  '.     / _     \        ║ 
-║  | |    \ |  ,-./  )       / ,-.|  \ _ \   / ,-.|  \ _ \  |  ,  \/  ,  |  / ,-.|  \ _ \   (`')`/--'         ║
-║  | |____/ /  \  '_ ')     ;  \  '_ /  | : ;  \  '_ /  | : |  |\_   /|  | ;  \  '_ /  | : (_ o _).           ║
-║  |   _ _ '.   > (_)  )    |  _`,/ \ _/  | |  _`,/ \ _/  | |  _( )_/ |  | |  _`,/ \ _/  |  (_,_). '.         ║ 
-║  |  ( ' )  \  (  .  .-'    : (  '\_/ \   ; : (  '\_/ \   ;| (_ o _) |  | : (  '\_/ \   ;\_.---.    \:       ║
-║  | (_{;}_) |  `-'`-'|___   \ `"/  \  ) /   \ `"/  \  ) /  |  (_,_)  |  |  \ `"/  \  ) /  \    `-'  |        ║
-║  |  (_,_)  /   |        \   '. \_/``".'     '. \_/``".'   |  |      |  |   '. \_/``".'    \       /         ║ 
-║  /_______.'    `--------`     '-----'         '-----'     '--'      '--'     '-----'       `-...-'          ║
-║                                                                                                             ║ 
-║                     Automated Installer                                                                     ║ 
-║                                                                                                             ║
-║               An Optimized Arch-linux Distro/Operating System,                                              ║ 
-║              This is the Automated Installer                                                                ║
-║                    Beta Version 0.10.0                                                                      ║
+║                                                                                                            
+║  _______      .---.          ,-----.         ,-----.      ,---.    ,---.     ,-----.        .-'''-.         
+║  \  ____  \    | ,_|        .'  .-,  '.     .'  .-,  '.   |    \  /    |   .'  .-,  '.     / _     \        
+║  | |    \ |  ,-./  )       / ,-.|  \ _ \   / ,-.|  \ _ \  |  ,  \/  ,  |  / ,-.|  \ _ \   (`')`/--'         
+║  | |____/ /  \  '_ ')     ;  \  '_ /  | : ;  \  '_ /  | : |  |\_   /|  | ;  \  '_ /  | : (_ o _).          
+║  |   _ _ '.   > (_)  )    |  _`,/ \ _/  | |  _`,/ \ _/  | |  _( )_/ |  | |  _`,/ \ _/  |  (_,_). '.         
+║  |  ( ' )  \  (  .  .-'    : (  '\_/ \   ; : (  '\_/ \   ;| (_ o _) |  | : (  '\_/ \   ;\_.---.    \:       
+║  | (_{;}_) |  `-'`-'|___   \ `"/  \  ) /   \ `"/  \  ) /  |  (_,_)  |  |  \ `"/  \  ) /  \    `-'  |        
+║  |  (_,_)  /   |        \   '. \_/``".'     '. \_/``".'   |  |      |  |   '. \_/``".'    \       /          
+║  /_______.'    `--------`     '-----'         '-----'     '--'      '--'     '-----'       `-...-'          
+║                                                                                                              
+║                     Automated Installer                                                                      
+║                                                                                                             
+║               An Optimized Arch-linux Distro/Operating System,                                               
+║              This is the Automated Installer                                                                
+║                    Beta Version 0.10.0                                                                      
 ╚═════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
 
 BANNER
