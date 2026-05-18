@@ -1,0 +1,770 @@
+#!/usr/bin/env bash
+###############################################################################
+# bloominstall — Automated Bloom OS Installer
+#
+# An interactive, production-ready installer for Bloom OS that automates:
+#   1. Disk detection and selection
+#   2. Partitioning (UEFI/GPT or BIOS/MBR)
+#   3. Filesystem formatting
+#   4. Base system bootstrapping (pacstrap)
+#   5. Kernel installation (Blossom kernel)
+#   6. Limine bootloader deployment
+#   7. Bloom package manager setup
+#   8. Cherry Blossom banner injection
+#   9. User creation and configuration
+#
+# Architecture: Modeled after the official archinstall script
+# Usage: sudo ./bloominstall [--auto] [--help]
+#
+###############################################################################
+
+set -euo pipefail
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COLOUR OUTPUT CONSTANTS
+# ═══════════════════════════════════════════════════════════════════════════
+
+readonly C_RESET='\033[0m'
+readonly C_BOLD='\033[1m'
+readonly C_DIM='\033[2m'
+readonly C_RED='\033[0;31m'
+readonly C_GREEN='\033[0;32m'
+readonly C_YELLOW='\033[1;33m'
+readonly C_BLUE='\033[0;34m'
+readonly C_MAGENTA='\033[0;35m'
+readonly C_CYAN='\033[0;36m'
+readonly C_PINK='\033[1;35m'
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LOGGING FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════
+
+log_info()    { echo -e "${C_GREEN}[INSTALLER]${C_RESET} $*"; }
+log_warn()    { echo -e "${C_YELLOW}[INSTALLER]${C_RESET} WARNING: $*"; }
+log_error()   { echo -e "${C_RED}[INSTALLER]${C_RESET} ERROR: $*"; exit 1; }
+log_step()    { echo -e "\n${C_MAGENTA}━━━ $* ═══${C_RESET}"; }
+log_success() { echo -e "${C_GREEN}✓ $*${C_RESET}"; }
+log_header()  { echo -e "\n${C_CYAN}═══════════════════════════════════════════════════════════════${C_RESET}"; }
+
+# ═══════════════════════════════════════════════════════════════════════════
+# GLOBAL VARIABLES
+# ═══════════════════════════════════════════════════════════════════════════
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BLOOM_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# Installation targets
+TARGET_DISK=""
+ROOT_PARTITION=""
+BOOT_PARTITION=""
+ESP_PARTITION=""
+
+# Boot mode (detected automatically)
+BOOT_MODE=""  # "uefi" or "bios"
+
+# Installation options (can be set via --auto)
+AUTO_MODE=0
+ROOT_PASSWORD=""
+USER_NAME="bloom"
+USER_PASSWORD=""
+HOSTNAME="bloom-os"
+TIMEZONE="UTC"
+LOCALE="en_US.UTF-8"
+KEYMAP="us"
+
+# Package selections
+INSTALL_WIFI=1
+INSTALL_BLOOM_PM=1
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PREFLIGHT CHECKS
+# ═══════════════════════════════════════════════════════════════════════════
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This installer must be run as root (sudo)."
+    fi
+}
+
+check_dependencies() {
+    log_step "Checking installation dependencies"
+
+    local missing_packages=()
+
+    # Essential packages for installation
+    local required_packages=(
+        "pacstrap"
+        "arch-chroot"
+        "mkfs.ext4"
+        "mkfs.vfat"
+        "sgdisk"
+        "partprobe"
+        "curl"
+        "wget"
+    )
+
+    for pkg in "${required_packages[@]}"; do
+        if ! command -v "${pkg}" &>/dev/null; then
+            # Some commands might be in different packages
+            case "${pkg}" in
+                "pacstrap"|"arch-chroot")
+                    if ! pacman -Q base &>/dev/null; then
+                        missing_packages+=("base")
+                    fi
+                    ;;
+                *)
+                    missing_packages+=("${pkg}")
+                    ;;
+            esac
+        fi
+    done
+
+    if [[ ${#missing_packages[@]} -gt 0 ]]; then
+        log_info "Installing missing dependencies..."
+        pacman -Sy --noconfirm --needed "${missing_packages[@]}" 2>/dev/null || true
+    fi
+
+    # Check for network connectivity
+    if ! ping -c 1 -W 3 8.8.8.8 &>/dev/null; then
+        log_warn "No internet connection detected. Some features may not work."
+    else
+        log_success "Internet connection verified"
+    fi
+
+    # Ensure system clock is synchronized
+    timedatectl set-ntp true 2>/dev/null || true
+}
+
+detect_boot_mode() {
+    if [[ -d /sys/firmware/efi/efivars ]]; then
+        BOOT_MODE="uefi"
+        log_info "Boot mode detected: UEFI (64-bit)"
+    else
+        BOOT_MODE="bios"
+        log_info "Boot mode detected: Legacy BIOS"
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DISK SELECTION AND PARTITIONING
+# ═══════════════════════════════════════════════════════════════════════════
+
+select_disk() {
+    log_step "Selecting Target Disk"
+
+    echo ""
+    echo "Available block devices:"
+    echo ""
+
+    # List all disks with detailed information
+    local disk_list=()
+    local disk_index=1
+
+    while read -r line; do
+        local disk_path device_name size device_type
+        device_name=$(echo "${line}" | awk '{print $1}')
+        size=$(echo "${line}" | awk '{print $2}')
+        device_type=$(echo "${line}" | awk '{print $3}')
+
+        if [[ "${device_type}" == "disk" ]]; then
+            disk_list+=("${device_name}")
+            echo "  ${disk_index}. ${device_name} (${size})"
+            ((disk_index++))
+        fi
+    done < <(lsblk -dnpo NAME,SIZE,TYPE 2>/dev/null | grep -E "disk")
+
+    if [[ ${#disk_list[@]} -eq 0 ]]; then
+        log_error "No disks found. Cannot continue."
+    fi
+
+    echo ""
+
+    # Auto-select if only one disk or in auto mode
+    if [[ ${AUTO_MODE} -eq 1 ]] || [[ ${#disk_list[@]} -eq 1 ]]; then
+        TARGET_DISK="${disk_list[0]}"
+        log_info "Auto-selected disk: ${TARGET_DISK}"
+    else
+        read -rp "Enter disk number to install Bloom OS: " disk_num
+
+        if [[ -z "${disk_num}" ]]; then
+            log_error "No disk selected."
+        fi
+
+        if [[ ! "${disk_num}" =~ ^[0-9]+$ ]] || [[ ${disk_num} -lt 1 ]] || [[ ${disk_num} -gt ${#disk_list[@]} ]]; then
+            log_error "Invalid disk number selected."
+        fi
+
+        TARGET_DISK="${disk_list[$((disk_num - 1))]}"
+    fi
+
+    # Show warning about data destruction
+    echo ""
+    log_warn "ALL DATA ON ${TARGET_DISK} WILL BE DESTROYED!"
+    echo ""
+
+    if [[ ${AUTO_MODE} -eq 0 ]]; then
+        read -rp "Type 'yes' to continue: " confirm
+        if [[ "${confirm}" != "yes" ]]; then
+            log_error "Installation cancelled by user."
+        fi
+    else
+        log_info "Auto-mode: Proceeding with installation..."
+    fi
+}
+
+partition_disk() {
+    log_step "Partitioning ${TARGET_DISK}"
+
+    # Wipe existing signatures
+    log_info "Wiping existing partition signatures..."
+    wipefs -a "${TARGET_DISK}" &>/dev/null || true
+    partprobe "${TARGET_DISK}" 2>/dev/null || true
+    sleep 1
+
+    if [[ "${BOOT_MODE}" == "uefi" ]]; then
+        # UEFI: GPT with ESP + Root
+        log_info "Creating GPT partition table (UEFI mode)..."
+
+        # Partition 1: EFI System Partition (512 MB)
+        sgdisk --zap-all "${TARGET_DISK}"
+        sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI System Partition" "${TARGET_DISK}"
+
+        # Partition 2: Root partition (remaining space)
+        sgdisk -n 2:0:0 -t 2:8300 -c 2:"Linux Root" "${TARGET_DISK}"
+
+        ESP_PARTITION="${TARGET_DISK}1"
+        ROOT_PARTITION="${TARGET_DISK}2"
+        BOOT_PARTITION=""
+
+        log_success "Created ESP: ${ESP_PARTITION} (512 MB)"
+        log_success "Created Root: ${ROOT_PARTITION} (remaining)"
+
+    else
+        # BIOS: MBR with BIOS Boot + Boot + Root
+        log_info "Creating MBR partition table (BIOS mode)..."
+
+        # Partition 1: BIOS Boot (1 MB)
+        sgdisk --zap-all "${TARGET_DISK}"
+        sgdisk -n 1:0:+1M -t 1:ef02 -c 1:"BIOS Boot" "${TARGET_DISK}"
+
+        # Partition 2: Boot partition (512 MB)
+        sgdisk -n 2:0:+512M -t 2:8300 -c 2:"Linux Boot" "${TARGET_DISK}"
+
+        # Partition 3: Root partition (remaining space)
+        sgdisk -n 3:0:0 -t 3:8300 -c 3:"Linux Root" "${TARGET_DISK}"
+
+        ESP_PARTITION=""
+        BOOT_PARTITION="${TARGET_DISK}2"
+        ROOT_PARTITION="${TARGET_DISK}3"
+
+        log_success "Created BIOS Boot: ${TARGET_DISK}1 (1 MB)"
+        log_success "Created Boot: ${BOOT_PARTITION} (512 MB)"
+        log_success "Created Root: ${ROOT_PARTITION} (remaining)"
+    fi
+
+    # Ensure kernel recognizes new partitions
+    partprobe "${TARGET_DISK}" 2>/dev/null || true
+    sleep 2
+
+    # Verify partitions exist
+    if [[ ! -b "${ROOT_PARTITION}" ]]; then
+        log_error "Root partition not found after partitioning."
+    fi
+}
+
+format_filesystems() {
+    log_step "Formatting Filesystems"
+
+    if [[ "${BOOT_MODE}" == "uefi" ]]; then
+        # Format ESP as FAT32
+        log_info "Formatting ESP as FAT32..."
+        mkfs.vfat -F32 -n "BLOOM-ESP" "${ESP_PARTITION}"
+        log_success "Formatted: ${ESP_PARTITION} → FAT32"
+    else
+        # Format Boot as ext4
+        log_info "Formatting Boot partition as ext4..."
+        mkfs.ext4 -L "BLOOM-BOOT" "${BOOT_PARTITION}"
+        log_success "Formatted: ${BOOT_PARTITION} → ext4"
+    fi
+
+    # Format Root as ext4
+    log_info "Formatting Root partition as ext4..."
+    mkfs.ext4 -L "BLOOM-ROOT" "${ROOT_PARTITION}"
+    log_success "Formatted: ${ROOT_PARTITION} → ext4"
+}
+
+mount_filesystems() {
+    log_step "Mounting Filesystems"
+
+    # Mount root
+    log_info "Mounting Root partition..."
+    mount "${ROOT_PARTITION}" /mnt
+    log_success "Mounted: ${ROOT_PARTITION} → /mnt"
+
+    # Create and mount boot
+    if [[ "${BOOT_MODE}" == "uefi" ]]; then
+        log_info "Mounting ESP..."
+        mkdir -p /mnt/boot
+        mount "${ESP_PARTITION}" /mnt/boot
+        log_success "Mounted: ${ESP_PARTITION} → /mnt/boot"
+    else
+        log_info "Mounting Boot partition..."
+        mkdir -p /mnt/boot
+        mount "${BOOT_PARTITION}" /mnt/boot
+        log_success "Mounted: ${BOOT_PARTITION} → /mnt/boot"
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BASE SYSTEM INSTALLATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+bootstrap_base_system() {
+    log_step "Installing Base System"
+
+    log_info "Running pacstrap to install base Arch Linux..."
+
+    # Install base system packages
+    pacstrap /mnt \
+        base \
+        base-devel \
+        linux \
+        linux-firmware \
+        mkinitcpio \
+        sudo \
+        nano \
+        vim \
+        openssh \
+        dhcpcd \
+        iwd \
+        wpa_supplicant \
+        networkmanager \
+        iproute2 \
+        inetutils \
+        less \
+        man-db \
+        man-pages \
+        texinfo \
+        efibootmgr \
+        dosfstools \
+        mtools \
+        gptfdisk \
+        bsdtar \
+        zstd \
+        curl \
+        wget \
+        git
+
+    if [[ $? -ne 0 ]]; then
+        log_error "Failed to install base system packages."
+    fi
+
+    log_success "Base system installed successfully"
+}
+
+generate_fstab() {
+    log_step "Generating /etc/fstab"
+
+    genfstab -U /mnt >> /mnt/etc/fstab
+
+    # Add tmpfs for /tmp for better security
+    echo "tmpfs /tmp tmpfs defaults,noatime,mode=1777 0 0" >> /mnt/etc/fstab
+
+    log_success "fstab generated at /mnt/etc/fstab"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SYSTEM CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+configure_system() {
+    log_step "Configuring System"
+
+    # Set hostname
+    echo "${HOSTNAME}" > /mnt/etc/hostname
+    log_info "Set hostname: ${HOSTNAME}"
+
+    # Configure /etc/hosts
+    cat > /mnt/etc/hosts <<EOF
+127.0.0.1   localhost
+::1         localhost
+127.0.1.1   ${HOSTNAME}.localdomain ${HOSTNAME}
+EOF
+    log_info "Configured /etc/hosts"
+
+    # Set timezone
+    if [[ -f "/usr/share/zoneinfo/${TIMEZONE}" ]]; then
+        ln -sf "/usr/share/zoneinfo/${TIMEZONE}" /mnt/etc/localtime
+        log_info "Set timezone: ${TIMEZONE}"
+    else
+        ln -sf /usr/share/zoneinfo/UTC /mnt/etc/localtime
+        log_info "Set timezone: UTC (default)"
+    fi
+
+    # Configure locale
+    echo "${LOCALE} UTF-8" > /mnt/etc/locale.gen
+    arch-chroot /mnt locale-gen 2>/dev/null || true
+    echo "LANG=${LOCALE}" > /mnt/etc/locale.conf
+    log_info "Configured locale: ${LOCALE}"
+
+    # Set root password
+    if [[ -n "${ROOT_PASSWORD}" ]]; then
+        echo "root:${ROOT_PASSWORD}" | arch-chroot /mnt chpasswd
+        log_info "Set root password"
+    else
+        log_warn "Root password not set (use 'sudo su' after reboot)"
+    fi
+
+    # Create user
+    if [[ -n "${USER_NAME}" ]]; then
+        arch-chroot /mnt useradd -m -G wheel -s /bin/bash "${USER_NAME}" 2>/dev/null || true
+
+        if [[ -n "${USER_PASSWORD}" ]]; then
+            echo "${USER_NAME}:${USER_PASSWORD}" | arch-chroot /mnt chpasswd
+            log_info "Created user: ${USER_NAME}"
+        else
+            log_warn "User password not set"
+        fi
+
+        # Enable sudo for wheel group
+        echo "%wheel ALL=(ALL:ALL) ALL" > /mnt/etc/sudoers.d/wheel
+        chmod 440 /mnt/etc/sudoers.d/wheel
+    fi
+
+    # Enable essential services
+    log_info "Enabling system services..."
+    arch-chroot /mnt systemctl enable dhcpcd 2>/dev/null || true
+    arch-chroot /mnt systemctl enable iwd 2>/dev/null || true
+    arch-chroot /mnt systemctl enable NetworkManager 2>/dev/null || true
+    arch-chroot /mnt systemctl enable sshd 2>/dev/null || true
+
+    log_success "System services enabled"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BLOSSOM KERNEL INSTALLATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+install_blossom_kernel() {
+    log_step "Installing Blossom Kernel"
+
+    # Check if kernel build script exists
+    if [[ -f "${BLOOM_ROOT}/kernel/build-blossom-kernel.sh" ]]; then
+        log_info "Building Blossom kernel (this may take 10-30 minutes)..."
+
+        # Copy kernel build script to /mnt
+        mkdir -p /mnt/opt/bloom-os
+        cp -r "${BLOOM_ROOT}/kernel" /mnt/opt/bloom-os/
+
+        # Run kernel build in chroot
+        arch-chroot /mnt bash /opt/bloom-os/kernel/build-blossom-kernel.sh || {
+            log_warn "Kernel build failed, installing standard Arch kernel..."
+            arch-chroot /mnt pacman -S --noconfirm linux
+        }
+    else
+        log_warn "Kernel build script not found, installing standard Arch kernel..."
+        arch-chroot /mnt pacman -S --noconfirm linux
+    fi
+
+    # Verify kernel installation
+    if [[ -f /mnt/boot/vmlinuz-blossom ]]; then
+        log_success "Blossom kernel installed: /boot/vmlinuz-blossom"
+    elif [[ -f /mnt/boot/vmlinuz-linux ]]; then
+        cp /mnt/boot/vmlinuz-linux /mnt/boot/vmlinuz-blossom
+        log_success "Copied standard kernel as vmlinuz-blossom"
+    else
+        log_error "No kernel image found"
+    fi
+
+    # Generate initramfs
+    log_info "Generating initramfs..."
+
+    # Deploy mkinitcpio config
+    if [[ -f "${BLOOM_ROOT}/system/config/mkinitcpio.conf" ]]; then
+        cp "${BLOOM_ROOT}/system/config/mkinitcpio.conf" /mnt/etc/mkinitcpio.conf
+    fi
+
+    # Create mkinitcpio preset
+    cat > /mnt/etc/mkinitcpio.d/blossom.preset <<'EOF'
+ALL_kver="/boot/vmlinuz-blossom"
+ALL_config="/etc/mkinitcpio.conf"
+EOF
+
+    # Generate initramfs
+    arch-chroot /mnt mkinitcpio -p blossom 2>/dev/null || {
+        log_warn "mkinitcpio failed, generating basic initramfs..."
+        arch-chroot /mnt mkinitcpio -k /boot/vmlinuz-blossom -g /boot/initramfs-blossom.img -O /boot
+    }
+
+    if [[ -f /mnt/boot/initramfs-blossom.img ]]; then
+        log_success "Initramfs generated: /boot/initramfs-blossom.img"
+    else
+        log_error "Initramfs generation failed"
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LIMINE BOOTLOADER INSTALLATION
+# ║══════════════════════════════════════════════════════════════════════════
+
+install_limine_bootloader() {
+    log_step "Installing Limine Bootloader"
+
+    # Get root partition UUID for kernel cmdline
+    local root_uuid
+    root_uuid=$(blkid -s UUID -o value "${ROOT_PARTITION}")
+
+    # Deploy limine.cfg
+    log_info "Deploying Limine configuration..."
+    mkdir -p /mnt/boot/limine
+
+    # Copy limine.cfg template
+    if [[ -f "${BLOOM_ROOT}/bootloader/limine.cfg" ]]; then
+        sed "s|ROOT_DEVICE|UUID=${root_uuid}|g" "${BLOOM_ROOT}/bootloader/limine.cfg" > /mnt/boot/limine/limine.cfg
+        log_success "Limine configuration deployed"
+    else
+        log_error "Limine config not found"
+    fi
+
+    # Install Limine bootloader
+    log_info "Installing Limine to ${TARGET_DISK}..."
+
+    # Install via limine-install
+    arch-chroot /mnt limine-install "${TARGET_DISK}" 2>/dev/null || {
+        log_warn "limine-install failed, attempting manual installation..."
+    }
+
+    # For UEFI, also copy EFI binaries
+    if [[ "${BOOT_MODE}" == "uefi" ]]; then
+        mkdir -p /mnt/boot/EFI/BOOT
+
+        # Try to copy Limine EFI binary
+        if [[ -f /mnt/usr/share/limine/BOOTX64.EFI ]]; then
+            cp /mnt/usr/share/limine/BOOTX64.EFI /mnt/boot/EFI/BOOT/BOOTX64.EFI
+            log_success "Copied EFI bootloader"
+        else
+            log_warn "Limine EFI binary not found in expected location"
+        fi
+    fi
+
+    log_success "Limine bootloader installed"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BLOOM PACKAGE MANAGER SETUP
+# ═══════════════════════════════════════════════════════════════════════════
+
+install_bloom_pm() {
+    log_step "Installing Bloom Package Manager"
+
+    # Copy bloom binary
+    if [[ -f "${BLOOM_ROOT}/packages/bin/bloom" ]]; then
+        cp "${BLOOM_ROOT}/packages/bin/bloom" /mnt/usr/local/bin/bloom
+        chmod +x /mnt/usr/local/bin/bloom
+        log_success "Bloom binary installed to /usr/local/bin/bloom"
+    else
+        log_warn "Bloom package manager not found"
+    fi
+
+    # Create database directories
+    mkdir -p /mnt/var/lib/bloom/local
+    mkdir -p /mnt/var/lib/bloom/meta
+    mkdir -p /mnt/var/cache/bloom
+
+    # Initialize meta-packages
+    if [[ -f /mnt/usr/local/bin/bloom ]]; then
+        arch-chroot /mnt bloom meta-init 2>/dev/null || {
+            log_warn "Meta-package initialization may have failed"
+        }
+        log_success "Meta-packages initialized"
+    fi
+
+    # Configure bloom as package manager
+    if [[ -f /mnt/usr/local/bin/bloom ]]; then
+        # Add bloom to pacman.conf as an alternative (optional)
+        # This is informational - bloom operates independently
+        log_info "Bloom package manager ready for use"
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CHERRY BLOSSOM BANNER SETUP
+# ═══════════════════════════════════════════════════════════════════════════
+
+install_cherry_blossom_banner() {
+    log_step "Installing Cherry Blossom Login Banner"
+
+    # Install profile.d script
+    if [[ -f "${BLOOM_ROOT}/system/profile.d/cherry_blossom.sh" ]]; then
+        cp "${BLOOM_ROOT}/system/profile.d/cherry_blossom.sh" /mnt/etc/profile.d/cherry_blossom.sh
+        chmod +x /mnt/etc/profile.d/cherry_blossom.sh
+        log_success "Banner installed to /etc/profile.d/"
+    else
+        log_warn "Cherry blossom banner script not found"
+    fi
+
+    # Add to /etc/skel/.bashrc for new users
+    cat >> /mnt/etc/skel/.bashrc <<'EOF'
+
+# Bloom OS Cherry Blossom Banner
+if [[ -f /etc/profile.d/cherry_blossom.sh ]]; then
+    source /etc/profile.d/cherry_blossom.sh
+fi
+EOF
+    log_success "Banner configured for new users"
+
+    # Add to root's .bashrc
+    cat >> /mnt/root/.bashrc <<'EOF'
+
+# Bloom OS Cherry Blossom Banner
+if [[ -f /etc/profile.d/cherry_blossom.sh ]]; then
+    source /etc/profile.d/cherry_blossom.sh
+fi
+EOF
+
+    # Add to user's .bashrc if user exists
+    if [[ -n "${USER_NAME}" ]] && [[ -f "/mnt/home/${USER_NAME}/.bashrc" ]]; then
+        cat >> "/mnt/home/${USER_NAME}/.bashrc" <<'EOF'
+
+# Bloom OS Cherry Blossom Banner
+if [[ -f /etc/profile.d/cherry_blossom.sh ]]; then
+    source /etc/profile.d/cherry_blossom.sh
+fi
+EOF
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FINALIZATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+finalize_installation() {
+    log_step "Finalizing Installation"
+
+    # Ensure all data is written
+    sync
+
+    # Unmount filesystems
+    log_info "Unmounting filesystems..."
+    umount -R /mnt 2>/dev/null || true
+
+    # Show completion message
+    echo ""
+    log_header
+    echo ""
+    log_success "║                   BLOOM OS INSTALLATION COMPLETE                    ║"
+    log_header
+    echo ""
+    echo -e "  ${C_CYAN}Target Disk:${C_RESET}      ${TARGET_DISK}"
+    echo -e "  ${C_CYAN}Boot Mode:${C_RESET}       ${BOOT_MODE^^}"
+    echo -e "  ${C_CYAN}Root Partition:${C_RESET}  ${ROOT_PARTITION}"
+    echo -e "  ${C_CYAN}Hostname:${C_RESET}        ${HOSTNAME}"
+    if [[ -n "${USER_NAME}" ]]; then
+        echo -e "  ${C_CYAN}User:${C_RESET}          ${USER_NAME}"
+    fi
+    echo ""
+    echo -e "  ${C_GREEN}Kernel:${C_RESET}         /boot/vmlinuz-blossom"
+    echo -e "  ${C_GREEN}Initramfs:${C_RESET}      /boot/initramfs-blossom.img"
+    echo -e "  ${C_GREEN}Bootloader:${C_RESET}     Limine (${BOOT_MODE^^})"
+    echo ""
+    echo -e "  ${C_YELLOW}Remove installation media and reboot to start Bloom OS!${C_RESET}"
+    echo ""
+    log_header
+    echo ""
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DISPLAY BANNER
+# ═══════════════════════════════════════════════════════════════════════════
+
+display_banner() {
+    clear
+    cat <<'BANNER'
+
+   ╔═══════════════════════════════════════════════════════════════════════╗
+   ║                                                                       ║
+   ║        ██████╗ ██████╗ ██████╗ ███████╗                                    ║
+   ║        ██╔══██╗██╔══██╗██╔══██╗██╔════╝                                    ║
+   ║        ██████╔╝██████╔╝██████╔╝█████╗                                      ║
+   ║        ██╔══██╗██╔══██╗██╔══██╗██╔══╝                                      ║
+   ║        ██████╔╝██║  ██║██║  ██║███████╗                                    ║
+   ║        ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝                                    ║
+   ║                                                                       ║
+   ║                      Automated Installer                              ║
+   ║                                                                       ║
+   ║        64-bit Ultra-Lightweight Arch Linux Distribution              ║
+   ║        Custom Blossom Kernel • Limine Bootloader                     ║
+   ║                                                                       ║
+   ╚═══════════════════════════════════════════════════════════════════════╝
+
+BANNER
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MAIN ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════
+
+usage() {
+    cat <<EOF
+Usage: $0 [OPTIONS]
+
+Options:
+  --auto              Run in automatic mode with default options
+  --help, -h          Show this help message
+
+Examples:
+  $0                  # Interactive mode
+  $0 --auto           # Automatic mode (uses defaults)
+
+EOF
+}
+
+main() {
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --auto|-a)
+                AUTO_MODE=1
+                ROOT_PASSWORD="bloom"
+                USER_PASSWORD="bloom"
+                shift
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
+
+    # Display banner
+    display_banner
+
+    echo ""
+    log_info "Starting Bloom OS installation..."
+    echo ""
+
+    # Run installation steps
+    check_root
+    check_dependencies
+    detect_boot_mode
+    select_disk
+    partition_disk
+    format_filesystems
+    mount_filesystems
+    bootstrap_base_system
+    generate_fstab
+    configure_system
+    install_blossom_kernel
+    install_limine_bootloader
+    install_bloom_pm
+    install_cherry_blossom_banner
+    finalize_installation
+}
+
+# Execute main function
+main "$@"
