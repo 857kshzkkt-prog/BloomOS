@@ -521,30 +521,127 @@ install_blossom_kernel() {
         log_error "No kernel image found"
     fi
 
-    # Generate initramfs
+    # ═══════════════════════════════════════════════════════════════════════════
+    # GENERATE INITRAMFS WITH PROPER CONFIGURATION
+    # ═══════════════════════════════════════════════════════════════════════════
+
     log_info "Generating initramfs..."
 
-    # Deploy mkinitcpio config
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP 1: Deploy essential configuration files for initramfs generation
+    # ─────────────────────────────────────────────────────────────────────────
+
+    log_info "Deploying mkinitcpio configuration..."
+
+    # Ensure mkinitcpio.d directory exists
+    mkdir -p /mnt/etc/mkinitcpio.d
+
+    # Deploy lean mkinitcpio.conf if available, otherwise create minimal version
     if [[ -f "${BLOOM_ROOT}/system/config/mkinitcpio.conf" ]]; then
         cp "${BLOOM_ROOT}/system/config/mkinitcpio.conf" /mnt/etc/mkinitcpio.conf
+    else
+        # Create minimal mkinitcpio.conf
+        cat > /mnt/etc/mkinitcpio.conf <<'EOFMKINIT'
+# Minimal mkinitcpio.conf for Bloom OS
+MODULES=(
+    ahci
+    sd_mod
+    nvme
+    ext4
+    hid_generic
+    usbhid
+    psmouse
+    atkbd
+    e1000e
+    r8169
+    igb
+    iwlwifi
+    ath9k
+    drm
+    i915
+    fbcon
+)
+
+HOOKS=(
+    base
+    udev
+    autodetect
+    keyboard
+    keymap
+    modconf
+    block
+    filesystems
+    fsck
+)
+
+COMPRESSION="zstd"
+EOFMKINIT
     fi
 
-    # Create mkinitcpio preset
-    cat > /mnt/etc/mkinitcpio.d/blossom.preset <<'EOF'
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP 2: Create console configuration to prevent sd-vconsole hook failure
+    # ─────────────────────────────────────────────────────────────────────────
+
+    log_info "Configuring console settings..."
+
+    # Create /mnt/etc/vconsole.conf with default settings
+    cat > /mnt/etc/vconsole.conf <<'EOFVCONSOLE'
+# Virtual console configuration for Bloom OS
+KEYMAP=us
+FONT=ter-v16n
+EOFVCONSOLE
+
+    # Also set locale for early console
+    echo "LANG=en_US.UTF-8" > /mnt/etc/locale.conf 2>/dev/null || true
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP 3: Create mkinitcpio preset for blossom kernel
+    # ─────────────────────────────────────────────────────────────────────────
+
+    log_info "Creating mkinitcpio preset..."
+
+    cat > /mnt/etc/mkinitcpio.d/blossom.preset <<'EOFPRESET'
+# mkinitcpio preset for Blossom kernel
 ALL_kver="/boot/vmlinuz-blossom"
 ALL_config="/etc/mkinitcpio.conf"
-EOF
+EOFPRESET
 
-    # Generate initramfs
-    arch-chroot /mnt mkinitcpio -p blossom 2>/dev/null || {
-        log_warn "mkinitcpio failed, generating basic initramfs..."
-        arch-chroot /mnt mkinitcpio -k /boot/vmlinuz-blossom -g /boot/initramfs-blossom.img -O /boot
-    }
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP 4: Generate initramfs using explicit targeted command
+    # ─────────────────────────────────────────────────────────────────────────
+
+    log_info "Building initramfs with explicit configuration..."
+
+    # Run mkinitcpio with explicit kernel and output paths
+    if arch-chroot /mnt mkinitcpio -k vmlinuz-blossom -c /etc/mkinitcpio.conf -g /boot/initramfs-blossom.img; then
+        log_success "Initramfs generated successfully"
+    else
+        # If that fails, try alternative method
+        log_warn "Primary method failed, trying alternative generation..."
+
+        if arch-chroot /mnt mkinitcpio -p blossom; then
+            # Copy the generated initramfs to our named version
+            if [[ -f /mnt/boot/initramfs-linux.img ]]; then
+                cp /mnt/boot/initramfs-linux.img /mnt/boot/initramfs-blossom.img
+                log_success "Initramfs generated via preset"
+            else
+                log_error "Initramfs generation failed - no output file created"
+            fi
+        else
+            log_error "All initramfs generation methods failed"
+        fi
+    fi
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP 5: Verify initramfs was created successfully
+    # ─────────────────────────────────────────────────────────────────────────
 
     if [[ -f /mnt/boot/initramfs-blossom.img ]]; then
-        log_success "Initramfs generated: /boot/initramfs-blossom.img"
+        local initramfs_size
+        initramfs_size=$(du -h /mnt/boot/initramfs-blossom.img | awk '{print $1}')
+        log_success "Initramfs created: /boot/initramfs-blossom.img (${initramfs_size})"
     else
-        log_error "Initramfs generation failed"
+        log_error "Initramfs generation FAILED - /mnt/boot/initramfs-blossom.img not found"
     fi
 }
 
