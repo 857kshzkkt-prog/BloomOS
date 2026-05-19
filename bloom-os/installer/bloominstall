@@ -8,7 +8,7 @@
 #   3. Filesystem formatting
 #   4. Base system bootstrapping (pacstrap)
 #   5. Kernel installation (Blossom kernel)
-#   6. Limine bootloader deployment
+#   6. GRUB bootloader deployment
 #   7. Bloom package manager setup
 #   8. Cherry Blossom banner injection
 #   9. User creation and configuration
@@ -413,6 +413,7 @@ bootstrap_base_system() {
         "curl"
         "wget"
         "git"
+        "grub"
     )
 
     # Execute pacstrap with the package list
@@ -671,50 +672,66 @@ EOFPRESET
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# LIMINE BOOTLOADER INSTALLATION
-# ║══════════════════════════════════════════════════════════════════════════
+# GRUB BOOTLOADER INSTALLATION
+# ═══════════════════════════════════════════════════════════════════════════
 
-install_limine_bootloader() {
-    log_step "Installing Limine Bootloader"
+install_grub_bootloader() {
+    log_step "Installing GRUB Bootloader"
 
-    # Get root partition UUID for kernel cmdline
+    # Get partition UUIDs
     local root_uuid
     root_uuid=$(blkid -s UUID -o value "${ROOT_PARTITION}")
 
-    # Deploy limine.cfg
-    log_info "Deploying Limine configuration..."
-    mkdir -p /mnt/boot/limine
-
-    # Copy limine.cfg template
-    if [[ -f "${BLOOM_ROOT}/bootloader/limine.cfg" ]]; then
-        sed "s|ROOT_DEVICE|UUID=${root_uuid}|g" "${BLOOM_ROOT}/bootloader/limine.cfg" > /mnt/boot/limine/limine.cfg
-        log_success "Limine configuration deployed"
-    else
-        log_error "Limine config not found"
+    # Determine which partition holds the kernels (boot partition or ESP)
+    local kernel_part_uuid=""
+    if [[ -n "${BOOT_PARTITION}" ]]; then
+        kernel_part_uuid=$(blkid -s UUID -o value "${BOOT_PARTITION}")
+    elif [[ -n "${ESP_PARTITION}" ]]; then
+        kernel_part_uuid=$(blkid -s UUID -o value "${ESP_PARTITION}")
     fi
 
-    # Install Limine bootloader
-    log_info "Installing Limine to ${TARGET_DISK}..."
+    # Install GRUB based on boot mode
+    if [[ "${BOOT_MODE}" == "uefi" ]]; then
+        log_info "Installing GRUB for UEFI (x86_64-efi)..."
+        arch-chroot /mnt grub-install --target=x86_64-efi --boot-directory=/boot --efi-directory=/boot --recheck || {
+            log_error "GRUB UEFI installation failed"
+        }
+    else
+        log_info "Installing GRUB for BIOS (i386-pc)..."
+        arch-chroot /mnt grub-install --target=i386-pc --boot-directory=/boot --recheck "${TARGET_DISK}" || {
+            log_error "GRUB BIOS installation failed"
+        }
+    fi
 
-    # Install via limine-install
-    arch-chroot /mnt limine-install "${TARGET_DISK}" 2>/dev/null || {
-        log_warn "limine-install failed, attempting manual installation..."
+    # Create custom entry for Blossom kernel
+    log_info "Creating GRUB custom entry for Blossom kernel..."
+
+    cat > /mnt/etc/grub.d/40_custom << GRUBEOF
+#!/bin/sh
+exec tail -n +3 \$0
+
+menuentry 'Bloom OS (Blossom kernel)' --class linux --class bloom {
+    search --no-floppy --fs-uuid --set=root ${kernel_part_uuid}
+    linux /vmlinuz-blossom root=UUID=${root_uuid} rw quiet loglevel=3
+    initrd /initramfs-blossom.img
+}
+
+menuentry 'Bloom OS (stock kernel)' --class linux --class bloom {
+    search --no-floppy --fs-uuid --set=root ${kernel_part_uuid}
+    linux /vmlinuz-linux root=UUID=${root_uuid} rw quiet loglevel=3
+    initrd /initramfs-linux.img
+}
+GRUBEOF
+
+    chmod +x /mnt/etc/grub.d/40_custom
+
+    # Generate GRUB config
+    log_info "Generating GRUB configuration..."
+    arch-chroot /mnt grub-mkconfig -o /boot/grub/grub.cfg || {
+        log_error "GRUB configuration generation failed"
     }
 
-    # For UEFI, also copy EFI binaries
-    if [[ "${BOOT_MODE}" == "uefi" ]]; then
-        mkdir -p /mnt/boot/EFI/BOOT
-
-        # Try to copy Limine EFI binary
-        if [[ -f /mnt/usr/share/limine/BOOTX64.EFI ]]; then
-            cp /mnt/usr/share/limine/BOOTX64.EFI /mnt/boot/EFI/BOOT/BOOTX64.EFI
-            log_success "Copied EFI bootloader"
-        else
-            log_warn "Limine EFI binary not found in expected location"
-        fi
-    fi
-
-    log_success "Limine bootloader installed"
+    log_success "GRUB bootloader installed successfully"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1078,7 +1095,7 @@ finalize_installation() {
     echo ""
     echo -e "  ${C_GREEN}Kernel:${C_RESET}         /boot/vmlinuz-blossom"
     echo -e "  ${C_GREEN}Initramfs:${C_RESET}      /boot/initramfs-blossom.img"
-    echo -e "  ${C_GREEN}Bootloader:${C_RESET}     Limine (${BOOT_MODE^^})"
+    echo -e "  ${C_GREEN}Bootloader:${C_RESET}     GRUB (${BOOT_MODE^^})"
     echo ""
     echo -e "  ${C_YELLOW}Remove installation media and reboot to start Bloom OS!${C_RESET}"
     echo ""
@@ -1177,7 +1194,7 @@ main() {
     generate_fstab
     configure_system
     install_blossom_kernel
-    install_limine_bootloader
+    install_grub_bootloader
     install_bloom_pm
     install_cherry_blossom_banner
 

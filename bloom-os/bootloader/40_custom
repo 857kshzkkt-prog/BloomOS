@@ -1,0 +1,23 @@
+#!/bin/sh
+exec tail -n +3 $0
+
+# ── Bloom OS custom GRUB entries ─────────────────────────────────────────
+# These entries are injected verbatim by grub-mkconfig via /etc/grub.d/
+#
+# search --fs-uuid locates the boot partition by its UUID so all kernel/
+# initrd paths are relative to that partition root (boot:/// semantics).
+#
+# The ROOT_UUID placeholder must be replaced with the root partition UUID.
+# BOOT_UUID placeholder must be replaced with the /boot partition UUID.
+
+menuentry 'Bloom OS (Blossom kernel)' --class linux --class bloom {
+    search --no-floppy --fs-uuid --set=root BOOT_UUID
+    linux /vmlinuz-blossom root=UUID=ROOT_UUID rw quiet loglevel=3
+    initrd /initramfs-blossom.img
+}
+
+menuentry 'Bloom OS (stock kernel)' --class linux --class bloom {
+    search --no-floppy --fs-uuid --set=root BOOT_UUID
+    linux /vmlinuz-linux root=UUID=ROOT_UUID rw quiet loglevel=3
+    initrd /initramfs-linux.img
+}
