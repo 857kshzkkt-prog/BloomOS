@@ -204,7 +204,9 @@ select_disk() {
 
     if [[ ${AUTO_MODE} -eq 0 ]]; then
         read -rp "Type 'yes' to continue: " confirm
-        if [[ "${confirm}" != "yes" ]]; then
+        # Normalise to lowercase and accept both 'y' and 'yes'
+        confirm="${confirm,,}"
+        if [[ "${confirm}" != "yes" && "${confirm}" != "y" ]]; then
             log_error "Installation cancelled by user."
         fi
     else
@@ -274,6 +276,29 @@ partition_disk() {
 
 format_filesystems() {
     log_step "Formatting Filesystems"
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # AGGRESSIVE UNMOUNT: Release all locks from prior runs
+    # ═══════════════════════════════════════════════════════════════════════
+
+    log_info "Releasing any active filesystem mounts..."
+
+    umount -R /mnt 2>/dev/null || true
+
+    if [[ -n "${ROOT_PARTITION}" ]]; then
+        umount "${ROOT_PARTITION}" 2>/dev/null || true
+    fi
+    if [[ -n "${ESP_PARTITION}" ]]; then
+        umount "${ESP_PARTITION}" 2>/dev/null || true
+    fi
+    if [[ -n "${BOOT_PARTITION}" ]]; then
+        umount "${BOOT_PARTITION}" 2>/dev/null || true
+    fi
+
+    # Wait for unmounts to settle
+    sleep 2
+
+    log_success "All mounts released"
 
     if [[ "${BOOT_MODE}" == "uefi" ]]; then
         # Format ESP as FAT32
@@ -777,6 +802,252 @@ EOF
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# I3WM GRAPHICAL PIPELINE SETUP (Ultra-Lightweight Desktop)
+# ═══════════════════════════════════════════════════════════════════════════
+
+setup_i3wm_desktop() {
+    log_step "Installing Ultra-Lightweight i3wm Desktop Environment"
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP 1: Install graphical packages via pacman inside chroot
+    # ─────────────────────────────────────────────────────────────────────────
+
+    log_info "Installing Xorg, i3wm, and supporting utilities..."
+
+    # Core package array for a minimal yet usable graphical environment
+    local desktop_packages=(
+        "xorg-server"
+        "xorg-xinit"
+        "xorg-drivers"
+        "i3-wm"
+        "i3status"
+        "i3lock"
+        "dmenu"
+        "alacritty"
+        "xorg-xrandr"
+        "xorg-xsetroot"
+        "xorg-xbacklight"
+        "xdotool"
+        "ttf-dejavu"
+        "ttf-liberation"
+    )
+
+    if ! arch-chroot /mnt pacman -S --noconfirm --needed "${desktop_packages[@]}"; then
+        log_warn "Desktop package installation encountered warnings — continuing"
+    fi
+
+    log_success "Desktop packages installed"
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP 2: Create .xinitrc in /etc/skel so every new user gets it
+    # ─────────────────────────────────────────────────────────────────────────
+
+    log_info "Writing ~/.xinitrc to launch i3 on 'startx'..."
+
+    cat > /mnt/etc/skel/.xinitrc <<'EOFXINITRC'
+#!/usr/bin/env bash
+# Minimal .xinitrc for Bloom OS — launches i3 window manager
+
+# Set a wallpaper or background colour (optional)
+xsetroot -solid "#1a0a0e"
+
+# Load system resources
+if [[ -f /etc/X11/xinit/xinitrc.d/50-systemd-user.sh ]]; then
+    source /etc/X11/xinit/xinitrc.d/50-systemd-user.sh
+fi
+
+# Launch i3 window manager
+exec i3
+EOFXINITRC
+
+    chmod 644 /mnt/etc/skel/.xinitrc
+
+    # Copy to root's home
+    cp /mnt/etc/skel/.xinitrc /mnt/root/.xinitrc 2>/dev/null || true
+
+    # Copy to existing user if one was created
+    if [[ -n "${USER_NAME}" ]] && [[ -d "/mnt/home/${USER_NAME}" ]]; then
+        cp /mnt/etc/skel/.xinitrc "/mnt/home/${USER_NAME}/.xinitrc"
+        arch-chroot /mnt chown "${USER_NAME}:${USER_NAME}" "/home/${USER_NAME}/.xinitrc" 2>/dev/null || true
+    fi
+
+    log_success ".xinitrc deployed to /etc/skel and user homes"
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP 3: Write the default i3 configuration
+    # ─────────────────────────────────────────────────────────────────────────
+
+    log_info "Creating default i3 configuration..."
+
+    mkdir -p /mnt/etc/skel/.config/i3
+
+    cat > /mnt/etc/skel/.config/i3/config <<'EOFI3CONF'
+# ── i3 configuration for Bloom OS ──────────────────────────────────────────
+# Ultra-lightweight tiling window manager setup
+
+# ── Mod key (Mod4 = Super/Windows key)
+set $mod Mod4
+
+# ── Font for window titles (small, clean)
+font pango:DejaVu Sans Mono 10
+
+# ── Terminal emulator (Mod4+Return)
+bindsym $mod+Return exec alacritty
+
+# ── Application launcher (Mod4+d)
+bindsym $mod+d exec dmenu_run
+
+# ── Kill focused window
+bindsym $mod+Shift+q kill
+
+# ── Focus navigation
+bindsym $mod+Left  focus left
+bindsym $mod+Down  focus down
+bindsym $mod+Up    focus up
+bindsym $mod+Right focus right
+
+# ── Move windows with focus
+bindsym $mod+Shift+Left  move left
+bindsym $mod+Shift+Down  move down
+bindsym $mod+Shift+Up    move up
+bindsym $mod+Shift+Right move right
+
+# ── Workspace switching
+bindsym $mod+1 workspace 1
+bindsym $mod+2 workspace 2
+bindsym $mod+3 workspace 3
+bindsym $mod+4 workspace 4
+bindsym $mod+5 workspace 5
+
+# ── Move containers to workspaces
+bindsym $mod+Shift+1 move container to workspace 1
+bindsym $mod+Shift+2 move container to workspace 2
+bindsym $mod+Shift+3 move container to workspace 3
+bindsym $mod+Shift+4 move container to workspace 4
+bindsym $mod+Shift+5 move container to workspace 5
+
+# ── Layout modes
+bindsym $mod+h split h
+bindsym $mod+v split v
+bindsym $mod+s layout stacking
+bindsym $mod+w layout tabbed
+bindsym $mod+e layout toggle split
+
+# ── Fullscreen
+bindsym $mod+f fullscreen toggle
+
+# ── Floating mode
+bindsym $mod+Shift+Space floating toggle
+
+# ── Resize mode
+mode "resize" {
+    bindsym Left   resize shrink width 10 px
+    bindsym Down   resize grow height 10 px
+    bindsym Up     resize shrink height 10 px
+    bindsym Right  resize grow width 10 px
+
+    bindsym Return mode "default"
+    bindsym Escape mode "default"
+}
+bindsym $mod+r mode "resize"
+
+# ── Reload / restart / exit
+bindsym $mod+Shift+c reload
+bindsym $mod+Shift+r restart
+bindsym $mod+Shift+e exec "i3-nagbar -t warning -m 'Exit i3?' -b 'Yes' 'i3-msg exit'"
+
+# ── Status bar
+bar {
+    position top
+    status_command i3status
+    colors {
+        background #1a0a0e
+        statusline #ffb7c5
+        separator  #c71585
+        focused_workspace  #ff69b4 #ff69b4 #1a0a0e
+        active_workspace   #c71585 #c71585 #ffffff
+        inactive_workspace #3a1a2e #3a1a2e #ffb7c5
+        urgent_workspace   #ff0000 #ff0000 #ffffff
+    }
+}
+
+# ── Window border colours (cherry blossom theme)
+client.focused          #ff69b4 #ff69b4 #1a0a0e #ff69b4
+client.focused_inactive #3a1a2e #3a1a2e #ffb7c5 #3a1a2e
+client.unfocused        #2a0a1e #2a0a1e #c71585 #2a0a1e
+client.urgent           #ff0000 #ff0000 #ffffff #ff0000
+EOFI3CONF
+
+    chmod 644 /mnt/etc/skel/.config/i3/config
+
+    # Copy i3 config to existing user
+    if [[ -n "${USER_NAME}" ]] && [[ -d "/mnt/home/${USER_NAME}" ]]; then
+        mkdir -p "/mnt/home/${USER_NAME}/.config/i3"
+        cp /mnt/etc/skel/.config/i3/config "/mnt/home/${USER_NAME}/.config/i3/config"
+        arch-chroot /mnt chown -R "${USER_NAME}:${USER_NAME}" "/home/${USER_NAME}/.config" 2>/dev/null || true
+    fi
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP 4: Write a default i3status configuration
+    # ─────────────────────────────────────────────────────────────────────────
+
+    mkdir -p /mnt/etc/skel/.config/i3status
+
+    cat > /mnt/etc/skel/.config/i3status/config <<'EOFI3STATUS'
+# i3status configuration for Bloom OS
+general {
+    colors = true
+    interval = 5
+}
+
+order += "ipv6"
+order += "wireless _first_"
+order += "ethernet _first_"
+order += "cpu_temperature 0"
+order += "memory"
+order += "disk /"
+order += "load"
+order += "tztime local"
+
+wireless _first_ {
+    format_up = "W: (%quality at %essid)"
+    format_down = "W: down"
+}
+
+ethernet _first_ {
+    format_up = "E: %ip"
+    format_down = "E: down"
+}
+
+cpu_temperature 0 {
+    format = "T: %degrees°C"
+}
+
+memory {
+    format = "%used/%total"
+}
+
+disk "/" {
+    format = "%avail"
+}
+
+tztime local {
+    format = "%Y-%m-%d %H:%M:%S"
+}
+EOFI3STATUS
+
+    # Copy to user if exists
+    if [[ -n "${USER_NAME}" ]] && [[ -d "/mnt/home/${USER_NAME}" ]]; then
+        mkdir -p "/mnt/home/${USER_NAME}/.config/i3status"
+        cp /mnt/etc/skel/.config/i3status/config "/mnt/home/${USER_NAME}/.config/i3status/config"
+        arch-chroot /mnt chown -R "${USER_NAME}:${USER_NAME}" "/mnt/home/${USER_NAME}/.config" 2>/dev/null || true
+    fi
+
+    log_success "i3wm desktop environment configured"
+    log_info "Run 'startx' after login to launch i3wm"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # FINALIZATION
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -909,6 +1180,21 @@ main() {
     install_limine_bootloader
     install_bloom_pm
     install_cherry_blossom_banner
+
+    # Optional: install ultra-lightweight i3wm desktop environment
+    if [[ ${AUTO_MODE} -eq 1 ]]; then
+        setup_i3wm_desktop
+    else
+        echo ""
+        read -rp "Install ultra-lightweight i3wm graphical environment? [y/N]: " install_i3
+        install_i3="${install_i3,,}"
+        if [[ "${install_i3}" == "y" || "${install_i3}" == "yes" ]]; then
+            setup_i3wm_desktop
+        else
+            log_info "Skipping i3wm desktop installation"
+        fi
+    fi
+
     finalize_installation
 }
 

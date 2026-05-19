@@ -27,7 +27,7 @@ readonly KERNEL_SRC="linux-${KERNEL_VERSION}"
 readonly KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_SERIES:0:1}.x/${KERNEL_SRC}.tar.xz"
 readonly WORKDIR="${HOME}/bloom-kernel-build"
 readonly KERNEL_DIR="${WORKDIR}/${KERNEL_SRC}"
-readonly MAKEFLAGS="-j$(nproc)"
+MAKEFLAGS="-j$(nproc)"
 
 # Blossom branding identifiers
 readonly KERNEL_NAME="Blossom kernel"
@@ -334,11 +334,12 @@ compile_kernel() {
     log_info "Compiling kernel with ${MAKEFLAGS}..."
 
     # Use smaller number of parallel jobs if memory is constrained
-    local mem_total_kb
+    local mem_total_kb mem_cores
     mem_total_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+    mem_cores=$(nproc)
     if [[ ${mem_total_kb} -lt 8000000 ]]; then
         log_warn "Memory below 8GB, using reduced parallelism"
-        MAKEFLAGS="-j4"
+        MAKEFLAGS="-j$(( mem_cores / 2 ))"
     fi
 
     make ${MAKEFLAGS} bzImage modules 2>&1 | tee "${WORKDIR}/build.log"
@@ -385,6 +386,17 @@ install_kernel() {
 
 generate_initramfs() {
     log_step "Generating initramfs via mkinitcpio"
+
+    # Ensure console configuration exists to prevent hook failure
+    if [[ ! -f /etc/vconsole.conf ]]; then
+        cat > /etc/vconsole.conf <<'EOFVC'
+KEYMAP=us
+FONT=ter-v16n
+EOFVC
+    fi
+
+    # Ensure mkinitcpio.d directory exists
+    mkdir -p /etc/mkinitcpio.d
 
     # Deploy lean mkinitcpio.conf
     cat > /etc/mkinitcpio.conf <<'EOFMKINIT'
@@ -457,6 +469,15 @@ EOFPRESET
     # Generate fallback initramfs
     log_info "Generating fallback initramfs..."
     mkinitcpio -p blossom -g /boot/initramfs-blossom-fallback.img -S autodiscover 2>/dev/null || true
+
+    # Verify initramfs file was actually created
+    if [[ -f /boot/initramfs-blossom.img ]]; then
+        local img_size
+        img_size=$(du -h /boot/initramfs-blossom.img | awk '{print $1}')
+        log_success "Initramfs generated: /boot/initramfs-blossom.img (${img_size})"
+    else
+        log_error "Initramfs generation FAILED - /boot/initramfs-blossom.img not found"
+    fi
 
     log_success "Initramfs generation complete"
 }
