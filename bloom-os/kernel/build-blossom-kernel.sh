@@ -25,7 +25,7 @@ readonly KERNEL_VERSION="6.6.80"
 readonly KERNEL_SERIES="6.6"
 readonly KERNEL_SRC="linux-${KERNEL_VERSION}"
 readonly KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_SERIES:0:1}.x/${KERNEL_SRC}.tar.xz"
-readonly WORKDIR="${HOME}/bloom-kernel-build"
+readonly WORKDIR="${WORKDIR:-${HOME}/bloom-kernel-build}"
 readonly KERNEL_DIR="${WORKDIR}/${KERNEL_SRC}"
 MAKEFLAGS="-j$(nproc)"
 
@@ -435,8 +435,9 @@ FILES=()
 
 HOOKS=(
     base
-    udev
+    systemd
     autodetect
+    microcode
     keyboard
     keymap
     modconf
@@ -452,8 +453,12 @@ EOFMKINIT
     # Create blossom mkinitcpio preset
     cat > /etc/mkinitcpio.d/blossom.preset <<'EOFPRESET'
 # mkinitcpio preset for Blossom kernel
-ALL_kver="/boot/vmlinuz-blossom"
 ALL_config="/etc/mkinitcpio.conf"
+ALL_kver="/boot/vmlinuz-blossom"
+ALL_microcode=()
+blossom_image="/boot/initramfs-blossom.img"
+blossom_fallback_image="/boot/initramfs-blossom-fallback.img"
+blossom_fallback_options="-S autodetect"
 EOFPRESET
 
     # Generate initramfs

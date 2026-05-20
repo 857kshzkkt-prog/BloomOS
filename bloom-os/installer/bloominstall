@@ -64,6 +64,7 @@ BOOT_MODE=""  # "uefi" or "bios"
 
 # Installation options (can be set via --auto)
 AUTO_MODE=0
+DEBUG_MODE=0
 ROOT_PASSWORD=""
 USER_NAME="bloom"
 USER_PASSWORD=""
@@ -514,10 +515,68 @@ EOF
 
 # ═══════════════════════════════════════════════════════════════════════════
 # BLOSSOM KERNEL INSTALLATION
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+
+verify_chroot_environment() {
+    log_info "Verifying chroot environment for kernel installation..."
+
+    local warnings=0
+
+    # Check critical mount points
+    for mount_point in /mnt/proc /mnt/sys /mnt/dev; do
+        if ! mountpoint -q "${mount_point}" 2>/dev/null; then
+            log_warn "Mount point ${mount_point} not detected (arch-chroot handles this)"
+            ((warnings++))
+        fi
+    done
+
+    # Check if mkinitcpio is installed in chroot
+    if [[ ! -f /mnt/usr/bin/mkinitcpio ]]; then
+        log_warn "mkinitcpio not found in chroot - will install during kernel setup"
+        ((warnings++))
+    fi
+
+    # Check if kernel modules directory exists
+    if [[ -d /mnt/usr/lib/modules ]]; then
+        local module_count
+        module_count=$(find /mnt/usr/lib/modules -name "*.ko*" 2>/dev/null | wc -l)
+        log_info "Found ${module_count} kernel modules in chroot"
+        if [[ ${module_count} -eq 0 ]]; then
+            log_warn "No kernel modules found - kernel may not be installed"
+            ((warnings++))
+        fi
+    else
+        log_warn "No /usr/lib/modules directory in chroot"
+        ((warnings++))
+    fi
+
+    # Check mkinitcpio.conf syntax
+    if [[ -f /mnt/etc/mkinitcpio.conf ]]; then
+        if ! bash -n /mnt/etc/mkinitcpio.conf 2>/dev/null; then
+            log_warn "mkinitcpio.conf may have syntax issues"
+            ((warnings++))
+        fi
+    fi
+
+    # Check preset files
+    if [[ -d /mnt/etc/mkinitcpio.d ]]; then
+        local preset_count
+        preset_count=$(ls /mnt/etc/mkinitcpio.d/*.preset 2>/dev/null | wc -l)
+        log_info "Found ${preset_count} mkinitcpio preset files"
+    fi
+
+    if [[ ${warnings} -gt 0 ]]; then
+        log_warn "Chroot environment has ${warnings} warnings - proceeding with caution"
+    else
+        log_success "Chroot environment verification complete"
+    fi
+}
 
 install_blossom_kernel() {
     log_step "Installing Blossom Kernel"
+
+    # Verify chroot environment before proceeding
+    verify_chroot_environment
 
     # Check if kernel build script exists
     if [[ -f "${BLOOM_ROOT}/kernel/build-blossom-kernel.sh" ]]; then
@@ -528,13 +587,24 @@ install_blossom_kernel() {
         cp -r "${BLOOM_ROOT}/kernel" /mnt/opt/bloom-os/
 
         # Run kernel build in chroot
-        arch-chroot /mnt bash /opt/bloom-os/kernel/build-blossom-kernel.sh || {
-            log_warn "Kernel build failed, installing standard Arch kernel..."
-            arch-chroot /mnt pacman -S --noconfirm linux
-        }
+        if ! arch-chroot /mnt bash /opt/bloom-os/kernel/build-blossom-kernel.sh; then
+            log_warn "Blossom kernel build failed, falling back to standard Arch kernel"
+
+            # Check if linux is already installed from pacstrap
+            if arch-chroot /mnt pacman -Q linux &>/dev/null; then
+                log_info "Standard kernel already installed, regenerating initramfs..."
+            else
+                log_info "Installing standard Arch kernel..."
+                arch-chroot /mnt pacman -S --noconfirm --needed linux || {
+                    log_error "Failed to install standard Arch kernel"
+                }
+            fi
+        fi
     else
         log_warn "Kernel build script not found, installing standard Arch kernel..."
-        arch-chroot /mnt pacman -S --noconfirm linux
+        arch-chroot /mnt pacman -S --noconfirm --needed linux || {
+            log_error "Failed to install standard Arch kernel"
+        }
     fi
 
     # Verify kernel installation
@@ -590,8 +660,9 @@ MODULES=(
 
 HOOKS=(
     base
-    udev
+    systemd
     autodetect
+    microcode
     keyboard
     keymap
     modconf
@@ -628,8 +699,12 @@ EOFVCONSOLE
 
     cat > /mnt/etc/mkinitcpio.d/blossom.preset <<'EOFPRESET'
 # mkinitcpio preset for Blossom kernel
-ALL_kver="/boot/vmlinuz-blossom"
 ALL_config="/etc/mkinitcpio.conf"
+ALL_kver="/boot/vmlinuz-blossom"
+ALL_microcode=()
+blossom_image="/boot/initramfs-blossom.img"
+blossom_fallback_image="/boot/initramfs-blossom-fallback.img"
+blossom_fallback_options="-S autodetect"
 EOFPRESET
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -639,22 +714,24 @@ EOFPRESET
     log_info "Building initramfs with explicit configuration..."
 
     # Run mkinitcpio with explicit kernel and output paths
-    if arch-chroot /mnt mkinitcpio -k vmlinuz-blossom -c /etc/mkinitcpio.conf -g /boot/initramfs-blossom.img; then
+    local mkinitcpio_log="/tmp/mkinitcpio-debug.log"
+    if arch-chroot /mnt bash -c "mkinitcpio -k vmlinuz-blossom -c /etc/mkinitcpio.conf -g /boot/initramfs-blossom.img 2>&1 | tee ${mkinitcpio_log}"; then
         log_success "Initramfs generated successfully"
     else
         # If that fails, try alternative method
         log_warn "Primary method failed, trying alternative generation..."
+        log_warn "Check ${mkinitcpio_log} for detailed error output"
 
-        if arch-chroot /mnt mkinitcpio -p blossom; then
+        if arch-chroot /mnt mkinitcpio -p blossom 2>&1 | tee -a "${mkinitcpio_log}"; then
             # Copy the generated initramfs to our named version
             if [[ -f /mnt/boot/initramfs-linux.img ]]; then
                 cp /mnt/boot/initramfs-linux.img /mnt/boot/initramfs-blossom.img
                 log_success "Initramfs generated via preset"
             else
-                log_error "Initramfs generation failed - no output file created"
+                log_error "Initramfs generation failed - no output file created. See ${mkinitcpio_log}"
             fi
         else
-            log_error "All initramfs generation methods failed"
+            log_error "All initramfs generation methods failed. See ${mkinitcpio_log}"
         fi
     fi
 
@@ -1144,11 +1221,13 @@ Usage: $0 [OPTIONS]
 
 Options:
   --auto              Run in automatic mode with default options
+  --debug             Enable debug mode with verbose trace output
   --help, -h          Show this help message
 
 Examples:
   $0                  # Interactive mode
   $0 --auto           # Automatic mode (uses defaults)
+  $0 --debug          # Debug mode (trace output to /tmp/bloominstall-debug.log)
 
 EOF
 }
@@ -1161,6 +1240,13 @@ main() {
                 AUTO_MODE=1
                 ROOT_PASSWORD="bloom"
                 USER_PASSWORD="bloom"
+                shift
+                ;;
+            --debug|-d)
+                DEBUG_MODE=1
+                set -x
+                exec 2>/tmp/bloominstall-debug.log
+                log_info "Debug mode enabled. Trace output: /tmp/bloominstall-debug.log"
                 shift
                 ;;
             --help|-h)
