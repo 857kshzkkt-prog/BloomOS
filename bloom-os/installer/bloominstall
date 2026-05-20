@@ -505,10 +505,16 @@ EOF
 
     # Enable essential services
     log_info "Enabling system services..."
-    arch-chroot /mnt systemctl enable dhcpcd 2>/dev/null || true
-    arch-chroot /mnt systemctl enable iwd 2>/dev/null || true
-    arch-chroot /mnt systemctl enable NetworkManager 2>/dev/null || true
-    arch-chroot /mnt systemctl enable sshd 2>/dev/null || true
+    # Use manual symlinks instead of systemctl to avoid systemd-journald coredumps in chroot
+    local services=("dhcpcd" "iwd" "NetworkManager" "sshd")
+    for svc in "${services[@]}"; do
+        if [[ -f "/mnt/usr/lib/systemd/system/${svc}.service" ]]; then
+            mkdir -p "/mnt/etc/systemd/system/multi-user.target.wants"
+            ln -sf "/usr/lib/systemd/system/${svc}.service" \
+                "/mnt/etc/systemd/system/multi-user.target.wants/${svc}.service" 2>/dev/null || true
+            log_info "Enabled: ${svc}"
+        fi
+    done
 
     log_success "System services enabled"
 }
@@ -522,18 +528,12 @@ verify_chroot_environment() {
 
     local warnings=0
 
-    # Check critical mount points
-    for mount_point in /mnt/proc /mnt/sys /mnt/dev; do
-        if ! mountpoint -q "${mount_point}" 2>/dev/null; then
-            log_warn "Mount point ${mount_point} not detected (arch-chroot handles this)"
-            ((warnings++))
-        fi
-    done
-
     # Check if mkinitcpio is installed in chroot
     if [[ ! -f /mnt/usr/bin/mkinitcpio ]]; then
         log_warn "mkinitcpio not found in chroot - will install during kernel setup"
         ((warnings++))
+    else
+        log_success "mkinitcpio found in chroot"
     fi
 
     # Check if kernel modules directory exists
@@ -555,7 +555,12 @@ verify_chroot_environment() {
         if ! bash -n /mnt/etc/mkinitcpio.conf 2>/dev/null; then
             log_warn "mkinitcpio.conf may have syntax issues"
             ((warnings++))
+        else
+            log_success "mkinitcpio.conf syntax OK"
         fi
+    else
+        log_warn "mkinitcpio.conf not found - will create during setup"
+        ((warnings++))
     fi
 
     # Check preset files
